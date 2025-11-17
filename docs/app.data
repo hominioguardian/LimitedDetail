@@ -1,0 +1,133 @@
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i : u32) -> VSOut {
+  var pos = array<vec2<f32>, 3>(vec2(-1.0, -3.0), vec2(3.0, 1.0), vec2(-1.0, 1.0));
+  var uv = array<vec2<f32>, 3>(vec2(0.0, 2.0), vec2(2.0, 0.0), vec2(0.0, 0.0));
+  var o : VSOut;
+  o.pos = vec4<f32>(pos[i], 0.0, 1.0);
+  o.uv = uv[i];
+  return o;
+}
+
+@group(0) @binding(0) var s : sampler;
+@group(0) @binding(1) var t : texture_2d<f32>;
+
+@fragment
+fn fs(i : VSOut) -> @location(0) vec4<f32> {
+  return textureSample(t, s, i.uv);
+}
+struct FrameUniforms {
+  frame : u32,
+};
+
+@group(0) @binding(0) var<uniform> params : FrameUniforms;
+@group(0) @binding(1) var outImg : texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let dims = textureDimensions(outImg);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let dimf = vec2<f32>(f32(dims.x), f32(dims.y));
+  let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5, 0.5)) / dimf;
+  let cycle = f32(params.frame) * 0.05;
+  let hue = cycle + uv.x * 6.2831853;
+  let rgb = 0.5 + 0.5 * vec3<f32>(
+    sin(hue),
+    sin(hue + 2.0943951),
+    sin(hue + 4.1887903));
+  let gradient = smoothstep(0.0, 1.0, uv.y);
+  textureStore(outImg, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(rgb * gradient, 1.0));
+}
+struct CameraUniforms {
+  viewProj : mat4x4<f32>,
+  terrainSize : vec2<f32>,
+  invTerrainSize : vec2<f32>,
+  metrics : vec4<f32>,
+  cameraPos : vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera : CameraUniforms;
+@group(0) @binding(1) var heightTex : texture_2d<u32>;
+
+fn sampleHeight(coord : vec2<i32>) -> f32 {
+  let size = vec2<i32>(i32(camera.terrainSize.x), i32(camera.terrainSize.y));
+  let clamped = clamp(coord, vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+  let raw = f32(textureLoad(heightTex, clamped, 0).x);
+  let normalized = raw / 65535.0;
+  return normalized * 2.0 - 1.0;
+}
+
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) worldPos : vec3<f32>,
+  @location(1) normal : vec3<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vid : u32, @builtin(instance_index) iid : u32) -> VSOut {
+  const tileQuads : u32 = 64u;
+  const tileVerts : u32 = tileQuads + 1u;
+  let step = max(u32(camera.metrics.z), 1u);
+  let terrainSize = vec2<u32>(u32(camera.terrainSize.x), u32(camera.terrainSize.y));
+  let quadsX = max(((terrainSize.x - 1u) + step - 1u) / step, 1u);
+  let quadsY = max(((terrainSize.y - 1u) + step - 1u) / step, 1u);
+  let tilesX = max((quadsX + tileQuads - 1u) / tileQuads, 1u);
+  let tilesY = max((quadsY + tileQuads - 1u) / tileQuads, 1u);
+  let maxTileIndex = tilesX * tilesY;
+  let clampedInstance = min(iid, maxTileIndex - 1u);
+  let tileX = clampedInstance % tilesX;
+  let tileY = clampedInstance / tilesX;
+  let maxVertex = tileVerts * tileVerts;
+  let clampedVid = min(vid, maxVertex - 1u);
+  let localX = clampedVid % tileVerts;
+  let localY = clampedVid / tileVerts;
+  let baseVertex = vec2<u32>(tileX * tileQuads, tileY * tileQuads);
+  let rawCoord = (baseVertex + vec2<u32>(localX, localY)) * step;
+  let maxCoord = terrainSize - vec2<u32>(1u, 1u);
+  let coord = min(rawCoord, maxCoord);
+
+  let heightScale = camera.metrics.x;
+  let cellScale = camera.metrics.y;
+  let height = sampleHeight(vec2<i32>(coord)) * heightScale;
+  let sizeF = vec2<f32>(camera.terrainSize);
+  let origin = 0.5 * (sizeF - vec2<f32>(1.0, 1.0)) * cellScale;
+  let worldPos = vec3<f32>(
+    f32(coord.x) * cellScale - origin.x,
+    height,
+    f32(coord.y) * cellScale - origin.y);
+
+  let s = i32(step);
+  let hL = sampleHeight(vec2<i32>(i32(coord.x) - s, i32(coord.y))) * heightScale;
+  let hR = sampleHeight(vec2<i32>(i32(coord.x) + s, i32(coord.y))) * heightScale;
+  let hD = sampleHeight(vec2<i32>(i32(coord.x), i32(coord.y) - s)) * heightScale;
+  let hU = sampleHeight(vec2<i32>(i32(coord.x), i32(coord.y) + s)) * heightScale;
+  let dx = vec3<f32>(2.0 * cellScale * f32(step), hR - hL, 0.0);
+  let dz = vec3<f32>(0.0, hU - hD, 2.0 * cellScale * f32(step));
+  let normal = normalize(cross(dz, dx));
+
+  var out : VSOut;
+  out.worldPos = worldPos;
+  out.normal = normal;
+  out.pos = camera.viewProj * vec4<f32>(worldPos, 1.0);
+  return out;
+}
+
+@fragment
+fn fs(input : VSOut) -> @location(0) vec4<f32> {
+  let lightDir = normalize(vec3<f32>(0.3, 0.8, 0.4));
+  let diff = max(dot(input.normal, lightDir), 0.15);
+  let baseColor = vec3<f32>(0.1, 0.35, 0.15);
+  let highlight = vec3<f32>(0.45, 0.6, 0.35);
+  let heightFactor = clamp((input.worldPos.y / max(camera.metrics.x, 0.0001)), 0.0, 1.0);
+  let litColor = mix(baseColor, highlight, heightFactor) * diff;
+  let fogDensity = max(camera.metrics.w, 0.0);
+  let fogColor = vec3<f32>(0.6, 0.68, 0.76);
+  let dist = length(input.worldPos - camera.cameraPos.xyz);
+  let fogFactor = clamp(1.0 - exp(-fogDensity * dist), 0.0, 0.7);
+  let finalColor = mix(litColor, fogColor, fogFactor);
+  return vec4<f32>(finalColor, 1.0);
+}
